@@ -73,6 +73,7 @@ class KeyValueNode:
         self.store: dict[str, dict[str, Any]] = {}
         self.last_index = 0
         self.applied_operations: dict[int, dict[str, Any]] = {}
+        self.pending_operation: dict[str, Any] | None = None
 
         self.app = Flask(f"kv-{node_id}")
         self._register_routes()
@@ -143,13 +144,48 @@ class KeyValueNode:
         if not isinstance(key, str) or not key:
             return jsonify(error="'key' must be a non-empty string"), 400
 
-        # Validate JSON serialisability before contacting replicas.
         try:
             json.dumps(payload["value"])
         except (TypeError, ValueError):
             return jsonify(error="'value' must be JSON serialisable"), 400
 
         with self.lock:
+
+            # Retry an earlier operation before accepting a new one.
+            if self.pending_operation is not None:
+                pending = self.pending_operation
+                retry_results = []
+
+                with ThreadPoolExecutor(max_workers=len(self.peers)) as executor:
+                    futures = [
+                        executor.submit(self._replicate_to_peer, peer, pending)
+                        for peer in self.peers
+                    ]
+                    for future in as_completed(futures):
+                        retry_results.append(future.result())
+
+                retry_acks = sum(
+                    1 for result in retry_results if result["acknowledged"]
+                )
+                required = self.quorum_size - 1
+
+                if retry_acks < required:
+                    return jsonify(
+                        error="write blocked: previous operation is still awaiting quorum",
+                        pending_index=pending["index"],
+                        acknowledgements=retry_acks,
+                        required_replica_acks=required,
+                        peer_results=retry_results,
+                    ), 503
+
+                self.store[pending["key"]] = {
+                    "value": pending["value"],
+                    "version": pending["index"],
+                }
+                self.last_index = pending["index"]
+                self.applied_operations[pending["index"]] = pending
+                self.pending_operation = None
+
             next_index = self.last_index + 1
             operation = {
                 "index": next_index,
@@ -157,17 +193,15 @@ class KeyValueNode:
                 "value": payload["value"],
             }
 
-            # Replicas are contacted in parallel. With quorum_size=2 in a
-            # three-node cluster, one replica acknowledgement is sufficient.
-            results: list[dict[str, Any]] = []
-            if self.peers:
-                with ThreadPoolExecutor(max_workers=len(self.peers)) as executor:
-                    futures = [
-                        executor.submit(self._replicate_to_peer, peer, operation)
-                        for peer in self.peers
-                    ]
-                    for future in as_completed(futures):
-                        results.append(future.result())
+            results = []
+
+            with ThreadPoolExecutor(max_workers=len(self.peers)) as executor:
+                futures = [
+                    executor.submit(self._replicate_to_peer, peer, operation)
+                    for peer in self.peers
+                ]
+                for future in as_completed(futures):
+                    results.append(future.result())
 
             acknowledgements = sum(
                 1 for result in results if result["acknowledged"]
@@ -175,17 +209,22 @@ class KeyValueNode:
             required = self.quorum_size - 1
 
             if acknowledgements < required:
+                # Keep the operation so the primary never reuses its index.
+                self.pending_operation = operation
+
                 return jsonify(
                     error="write rejected: replication quorum not reached",
                     index=next_index,
                     acknowledgements=acknowledgements,
                     required_replica_acks=required,
+                    pending_operation=True,
                     peer_results=results,
                 ), 503
 
-            # Commit locally only after the configured write quorum has
-            # acknowledged the operation.
-            self.store[key] = {"value": payload["value"], "version": next_index}
+            self.store[key] = {
+                "value": payload["value"],
+                "version": next_index,
+            }
             self.last_index = next_index
             self.applied_operations[next_index] = operation
 
