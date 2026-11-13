@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Start a local 3-node cluster and exercise concurrent writes and replica loss."""
+"""Start a local 3-node cluster and exercise fault tolerance, recovery, and quorum."""
 
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import time
@@ -35,14 +34,14 @@ def request_json(
     timeout: float = REQUEST_TIMEOUT,
 ) -> tuple[int, dict[str, Any]]:
     body = None if payload is None else json.dumps(payload).encode("utf-8")
-    request = Request(
+    req = Request(
         url,
         data=body,
         method=method,
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with urlopen(req, timeout=timeout) as response:
             raw = response.read()
             return response.status, json.loads(raw) if raw else {}
     except HTTPError as exc:
@@ -70,6 +69,17 @@ def wait_for_node(url: str, process: subprocess.Popen, timeout: float = 12.0) ->
     raise TimeoutError(f"Node at {url} did not become ready. Last error: {last_error}")
 
 
+def stop_node(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=4)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+
 def start_node(
     node_id: str,
     role: str,
@@ -80,18 +90,22 @@ def start_node(
     command = [
         sys.executable,
         str(NODE_SCRIPT),
-        "--node-id", node_id,
-        "--role", role,
-        "--port", str(port),
-        "--timeout", "0.35",
-        "--quorum-size", "2",
+        "--node-id",
+        node_id,
+        "--role",
+        role,
+        "--port",
+        str(port),
+        "--timeout",
+        "0.35",
+        "--quorum-size",
+        "2",
     ]
     if peers:
         command.extend(["--peers", peers])
     if primary_url:
         command.extend(["--primary-url", primary_url])
 
-    # Keep node output visible so a failed experiment is diagnosable.
     return subprocess.Popen(command, cwd=ROOT)
 
 
@@ -126,9 +140,11 @@ def assert_read(url: str, key: str, expected_value: Any) -> None:
 def main() -> int:
     processes: list[subprocess.Popen] = []
     try:
-        print("[1/6] Starting the primary and two replicas...")
+        print("[1/7] Starting primary and two replicas...")
         primary = start_node(
-            "node-1", "primary", PRIMARY_PORT,
+            "node-1",
+            "primary",
+            PRIMARY_PORT,
             peers=f"{REPLICA_A_URL},{REPLICA_B_URL}",
         )
         processes.append(primary)
@@ -147,70 +163,99 @@ def main() -> int:
         wait_for_node(REPLICA_A_URL, replica_a)
         wait_for_node(REPLICA_B_URL, replica_b)
 
-        print("[2/6] Sending concurrent writes while all three nodes are healthy...")
+        print("[2/7] Sending 30 concurrent writes while all three nodes are healthy...")
         before_failure = run_concurrent_writes(count=30, phase="before")
         print(f"      Committed {len(before_failure)} concurrent writes.")
 
-        print("[3/6] Terminating replica node-2 (port 5002)...")
-        replica_a.terminate()
-        try:
-            replica_a.wait(timeout=4)
-        except subprocess.TimeoutExpired:
-            replica_a.kill()
-            replica_a.wait(timeout=2)
-
-        print("[4/6] Continuing concurrent writes with one replica unavailable...")
+        print("[3/7] Terminating replica node-2 (port 5002) and sending 20 writes...")
+        stop_node(replica_a)
         after_failure = run_concurrent_writes(count=20, phase="after")
-        print(f"      Committed {len(after_failure)} writes after replica loss.")
-
-        # Each successful post-failure write must have reached the remaining
-        # replica, satisfying a 2-of-3 quorum (primary + one replica).
         for item in after_failure:
             response = item["response"]
             if response["acknowledgements"] < 1:
-                raise AssertionError("A post-failure write did not reach a replica.")
-            successful_peers = [
-                result for result in response["peer_results"]
-                if result["acknowledged"]
-            ]
-            if len(successful_peers) < 1:
-                raise AssertionError("No surviving replica acknowledged a write.")
+                raise AssertionError("Post-failure write did not satisfy quorum.")
+        print(f"      Committed {len(after_failure)} writes with 1 replica down.")
 
-        print("[5/6] Verifying reads through the primary and surviving replica...")
+        print("[4/7] Restarting replica node-2 and verifying automatic log catch-up...")
+        replica_a_restarted = start_node(
+            "node-2", "replica", REPLICA_A_PORT, primary_url=PRIMARY_URL
+        )
+        processes.append(replica_a_restarted)
+        wait_for_node(REPLICA_A_URL, replica_a_restarted)
+
+        # Verify catch-up plus replicated DELETE operation.
+        temp_key = "ephemeral-check"
+        status, _ = request_json("POST", f"{PRIMARY_URL}/kv", {"key": temp_key, "value": 1})
+        if status != 200:
+            raise AssertionError("Post-recovery write failed.")
+        del_status, _ = request_json("DELETE", f"{PRIMARY_URL}/kv/{temp_key}")
+        if del_status != 200:
+            raise AssertionError("Replicated DELETE failed.")
+
+        _, p_state = request_json("GET", f"{PRIMARY_URL}/internal/state")
+        _, ra_state = request_json("GET", f"{REPLICA_A_URL}/internal/state")
+        _, rb_state = request_json("GET", f"{REPLICA_B_URL}/internal/state")
+        if not (
+            p_state["last_index"] == ra_state["last_index"] == rb_state["last_index"]
+            and p_state["store"] == ra_state["store"] == rb_state["store"]
+        ):
+            raise AssertionError("Recovered replica failed to reach full state parity.")
+        print(f"      All 3 nodes synchronized at log index {p_state['last_index']}.")
+
+        print("[5/7] Stopping both replicas to verify quorum-loss write rejection (503)...")
+        stop_node(replica_a_restarted)
+        stop_node(replica_b)
+        q_status, q_body = request_json(
+            "POST", f"{PRIMARY_URL}/kv", {"key": "quorum-lost", "value": "must-wait"}
+        )
+        if q_status != 503:
+            raise AssertionError(f"Expected 503 on quorum loss, got {q_status}: {q_body}")
+
+        # Restore one replica and verify the pending operation commits cleanly.
+        replica_b_restarted = start_node(
+            "node-3", "replica", REPLICA_B_PORT, primary_url=PRIMARY_URL
+        )
+        processes.append(replica_b_restarted)
+        wait_for_node(REPLICA_B_URL, replica_b_restarted)
+        rec_status, _ = request_json(
+            "POST", f"{PRIMARY_URL}/kv", {"key": "post-quorum", "value": "ok"}
+        )
+        if rec_status != 200:
+            raise AssertionError("Failed to recover pending operation after quorum restoration.")
+        assert_read(PRIMARY_URL, "quorum-lost", "must-wait")
+        assert_read(PRIMARY_URL, "post-quorum", "ok")
+        print("      Quorum-loss rejection and pending-operation recovery verified.")
+
+        print("[6/7] Verifying forwarded reads and stale-possible local fallback reads...")
         all_writes = before_failure + after_failure
         for item in all_writes:
             assert_read(PRIMARY_URL, item["key"], item["value"])
-            # A replica read is forwarded to the primary while it is healthy.
             assert_read(REPLICA_B_URL, item["key"], item["value"])
 
-        print("[6/6] Comparing the primary and surviving replica state...")
-        _, primary_state = request_json("GET", f"{PRIMARY_URL}/internal/state")
-        _, replica_state = request_json("GET", f"{REPLICA_B_URL}/internal/state")
+        stop_node(primary)
+        fb_status, fb_body = request_json("GET", f"{REPLICA_B_URL}/kv/post-quorum")
+        if (
+            fb_status != 200
+            or fb_body.get("value") != "ok"
+            or fb_body.get("consistency") != "local_fallback_stale_possible"
+        ):
+            raise AssertionError(f"Unexpected fallback read response: {fb_status}, {fb_body}")
 
-        if primary_state["last_index"] != replica_state["last_index"]:
-            raise AssertionError(
-                f"Log index mismatch: primary={primary_state['last_index']}, "
-                f"replica={replica_state['last_index']}"
+        print("[7/7] PASS: all fault-tolerance, catch-up, quorum, and fallback checks succeeded.")
+        print(
+            json.dumps(
+                {
+                    "writes_before_failure": len(before_failure),
+                    "writes_after_failure": len(after_failure),
+                    "delete_and_catchup_verified": True,
+                    "quorum_loss_503_verified": True,
+                    "pending_recovery_verified": True,
+                    "stale_fallback_read_verified": True,
+                    "total_read_checks": len(all_writes) * 2 + 3,
+                },
+                indent=2,
             )
-        if primary_state["store"] != replica_state["store"]:
-            raise AssertionError("Primary and surviving replica stores diverged.")
-
-        print("\nPASS: the experiment completed successfully.")
-        print(json.dumps({
-            "cluster": {
-                "primary": PRIMARY_URL,
-                "terminated_replica": REPLICA_A_URL,
-                "surviving_replica": REPLICA_B_URL,
-            },
-            "writes_before_failure": len(before_failure),
-            "writes_after_failure": len(after_failure),
-            "total_committed_writes": len(all_writes),
-            "primary_last_index": primary_state["last_index"],
-            "surviving_replica_last_index": replica_state["last_index"],
-            "primary_and_survivor_state_equal": True,
-            "read_checks": len(all_writes) * 2,
-            "quorum": "2 of 3 nodes (primary + at least one replica)",
-        }, indent=2))
+        )
         return 0
 
     except Exception as exc:
@@ -220,13 +265,7 @@ def main() -> int:
     finally:
         print("\nCleaning up node processes...")
         for process in reversed(processes):
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=2)
+            stop_node(process)
 
 
 if __name__ == "__main__":
