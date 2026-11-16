@@ -1,66 +1,24 @@
 #!/usr/bin/env python3
-"""Primary-replica key-value store with quorum replication and log catch-up.
-
-State is held in memory with a fixed primary role (no leader election or
-consensus protocol). Writes commit only after reaching the configured write
-quorum across the primary and its replicas, and lagging replicas automatically
-replay missed log entries when reconnecting.
-"""
-
 from __future__ import annotations
 
 import argparse
-import copy
-import http.client
 import json
 import logging
 import signal
-import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, request
 from werkzeug.serving import make_server
 
+from kvstore.state import StoreState
+from kvstore.transport import http_json
+from kvstore.wal import WriteAheadLog
+
 LOGGER = logging.getLogger("kv-node")
-
-
-def http_json(
-    method: str,
-    url: str,
-    payload: dict[str, Any] | None = None,
-    timeout: float = 0.5,
-) -> tuple[int, dict[str, Any]]:
-    """Send a JSON request and return (HTTP status, decoded JSON body)."""
-    body = None if payload is None else json.dumps(payload).encode("utf-8")
-    req = Request(
-        url,
-        data=body,
-        method=method,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urlopen(req, timeout=timeout) as response:
-            raw = response.read()
-            if not raw:
-                return response.status, {}
-            try:
-                return response.status, json.loads(raw)
-            except json.JSONDecodeError:
-                return response.status, {"raw": raw.decode("utf-8", errors="replace")}
-    except HTTPError as exc:
-        raw = exc.read()
-        try:
-            decoded = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            decoded = {"error": raw.decode("utf-8", errors="replace")}
-        return exc.code, decoded
-    except (URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
-        raise ConnectionError(str(exc)) from exc
 
 
 class KeyValueNode:
@@ -72,6 +30,7 @@ class KeyValueNode:
         primary_url: str | None = None,
         timeout: float = 0.5,
         quorum_size: int = 2,
+        wal_path: str | Path | None = None,
     ) -> None:
         if role not in ("primary", "replica"):
             raise ValueError("role must be 'primary' or 'replica'")
@@ -86,24 +45,12 @@ class KeyValueNode:
         self.primary_url = primary_url.rstrip("/") if primary_url else None
         self.timeout = timeout
         self.quorum_size = quorum_size
+        self.wal_path = Path(wal_path) if wal_path else None
 
-        # One lock serializes both state mutations and monotonically increasing
-        # log indices. Holding it through replication preserves linear log order.
-        self.lock = threading.Lock()
-        self.store: dict[str, dict[str, Any]] = {}
-        self.last_index = 0
-        self.applied_operations: dict[int, dict[str, Any]] = {}
+        # Only serialize primary write rounds; state reads stay lock-free of peer I/O.
+        self._write_lock = threading.Lock()
+        self.state = StoreState(wal=WriteAheadLog(self.wal_path) if self.wal_path else None)
         self.pending_operation: dict[str, Any] | None = None
-        self.stats: dict[str, int] = {
-            "writes_committed": 0,
-            "deletes_committed": 0,
-            "writes_rejected_quorum": 0,
-            "writes_rejected_conflict": 0,
-            "reads_primary": 0,
-            "reads_forwarded": 0,
-            "reads_stale_fallback": 0,
-            "replica_catchups": 0,
-        }
 
         self._executor = ThreadPoolExecutor(
             max_workers=max(1, len(self.peers)),
@@ -113,6 +60,22 @@ class KeyValueNode:
         self.app = Flask(f"kv-{node_id}")
         self._register_routes()
 
+    @property
+    def store(self) -> dict[str, dict[str, Any]]:
+        return self.state.store
+
+    @property
+    def last_index(self) -> int:
+        return self.state.last_index
+
+    @property
+    def applied_operations(self) -> dict[int, dict[str, Any]]:
+        return self.state.applied_operations
+
+    @property
+    def stats(self) -> dict[str, int]:
+        return self.state.stats
+
     def close(self) -> None:
         self._executor.shutdown(wait=True, cancel_futures=False)
 
@@ -121,61 +84,14 @@ class KeyValueNode:
         self.app.add_url_rule("/kv", "write", self.write, methods=["POST"])
         self.app.add_url_rule("/kv/<path:key>", "read", self.read, methods=["GET"])
         self.app.add_url_rule("/kv/<path:key>", "delete", self.delete, methods=["DELETE"])
-        self.app.add_url_rule(
-            "/internal/replicate",
-            "replicate",
-            self.replicate,
-            methods=["POST"],
-        )
-        self.app.add_url_rule(
-            "/internal/log",
-            "internal_log",
-            self.internal_log,
-            methods=["GET"],
-        )
-        self.app.add_url_rule(
-            "/internal/state",
-            "internal_state",
-            self.internal_state,
-            methods=["GET"],
-        )
-
-    @staticmethod
-    def _normalize_operation(operation: dict[str, Any]) -> dict[str, Any]:
-        op_type = operation.get("op", "put")
-        normalized: dict[str, Any] = {
-            "index": operation["index"],
-            "op": op_type,
-            "key": operation["key"],
-        }
-        if op_type == "put":
-            normalized["value"] = operation.get("value")
-        return normalized
-
-    def _apply_operation_locked(self, operation: dict[str, Any]) -> None:
-        normalized = self._normalize_operation(operation)
-        index = normalized["index"]
-        key = normalized["key"]
-
-        if normalized["op"] == "delete":
-            self.store.pop(key, None)
-        else:
-            self.store[key] = {
-                "value": copy.deepcopy(normalized["value"]),
-                "version": index,
-            }
-
-        self.last_index = index
-        self.applied_operations[index] = normalized
+        self.app.add_url_rule("/internal/replicate", "replicate", self.replicate, methods=["POST"])
+        self.app.add_url_rule("/internal/log", "internal_log", self.internal_log, methods=["GET"])
+        self.app.add_url_rule("/internal/state", "internal_state", self.internal_state, methods=["GET"])
 
     def sync_from_primary(self) -> int:
-        """Replica startup helper: fetch any existing primary log entries."""
         if self.role != "replica" or not self.primary_url:
             return 0
-
-        with self.lock:
-            from_index = self.last_index + 1
-
+        from_index = self.state.next_index()
         try:
             status, body = http_json(
                 "GET",
@@ -184,38 +100,25 @@ class KeyValueNode:
             )
         except ConnectionError:
             return 0
-
         if status != 200:
             return 0
-
         operations = body.get("operations", [])
         if not isinstance(operations, list):
             return 0
-
-        applied = 0
-        with self.lock:
-            for item in operations:
-                if not isinstance(item, dict):
-                    continue
-                index = item.get("index")
-                if index == self.last_index + 1:
-                    self._apply_operation_locked(item)
-                    applied += 1
-            if applied > 0:
-                self.stats["replica_catchups"] += 1
-        return applied
+        return self.state.apply_catchup_batch(operations)
 
     def health(self):
-        with self.lock:
-            return jsonify(
-                node_id=self.node_id,
-                role=self.role,
-                last_index=self.last_index,
-                key_count=len(self.store),
-                quorum_size=self.quorum_size,
-                has_pending_operation=self.pending_operation is not None,
-                stats=dict(self.stats),
-            )
+        snap = self.state.snapshot()
+        return jsonify(
+            node_id=self.node_id,
+            role=self.role,
+            last_index=snap["last_index"],
+            key_count=snap["key_count"],
+            quorum_size=self.quorum_size,
+            has_pending_operation=self.pending_operation is not None,
+            wal_enabled=self.wal_path is not None,
+            stats=snap["stats"],
+        )
 
     def _catch_up_peer(
         self,
@@ -223,15 +126,14 @@ class KeyValueNode:
         start_index: int,
         target_operation: dict[str, Any],
     ) -> dict[str, Any]:
-        """Replay missing ordered log entries to bring a lagging replica up to date."""
         for idx in range(start_index, target_operation["index"]):
-            missing_op = self.applied_operations.get(idx)
+            missing_op = self.state.get_op(idx)
             if missing_op is None:
                 return {
                     "peer": peer,
                     "acknowledged": False,
                     "status": 409,
-                    "detail": f"missing primary log entry {idx} during catch-up",
+                    "detail": f"missing primary log entry {idx}",
                 }
             status, body = http_json(
                 "POST",
@@ -261,9 +163,7 @@ class KeyValueNode:
             "detail": body.get("message", body.get("error", "")),
         }
 
-    def _replicate_to_peer(
-        self, peer: str, operation: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _replicate_to_peer(self, peer: str, operation: dict[str, Any]) -> dict[str, Any]:
         try:
             status, body = http_json(
                 "POST",
@@ -277,7 +177,6 @@ class KeyValueNode:
                 and 1 <= body["expected_index"] < operation["index"]
             ):
                 return self._catch_up_peer(peer, body["expected_index"], operation)
-
             return {
                 "peer": peer,
                 "acknowledged": status == 200 and body.get("acknowledged") is True,
@@ -292,9 +191,7 @@ class KeyValueNode:
                 "detail": str(exc),
             }
 
-    def _broadcast_operation(
-        self, operation: dict[str, Any]
-    ) -> list[dict[str, Any]]:
+    def _broadcast_operation(self, operation: dict[str, Any]) -> list[dict[str, Any]]:
         if not self.peers:
             return []
         futures = [
@@ -304,21 +201,18 @@ class KeyValueNode:
         results = [future.result() for future in as_completed(futures)]
         caught_up = sum(1 for item in results if "caught_up_from" in item and item["acknowledged"])
         if caught_up:
-            self.stats["replica_catchups"] += caught_up
+            self.state.inc_stat("replica_catchups", caught_up)
         return results
 
-    def _commit_with_quorum_locked(
-        self, op_type: str, key: str, value: Any = None
-    ):
+    def _commit_with_quorum_locked(self, op_type: str, key: str, value: Any = None):
         required = self.quorum_size - 1
 
-        # Resolve any blocked prior operation before assigning a new log index.
         if self.pending_operation is not None:
             pending = self.pending_operation
             retry_results = self._broadcast_operation(pending)
             retry_acks = sum(1 for r in retry_results if r["acknowledged"])
             if retry_acks < required:
-                self.stats["writes_rejected_quorum"] += 1
+                self.state.inc_stat("writes_rejected_quorum")
                 return jsonify(
                     error="write blocked: previous operation is still awaiting quorum",
                     pending_index=pending["index"],
@@ -327,14 +221,10 @@ class KeyValueNode:
                     peer_results=retry_results,
                 ), 503
 
-            self._apply_operation_locked(pending)
-            if pending["op"] == "delete":
-                self.stats["deletes_committed"] += 1
-            else:
-                self.stats["writes_committed"] += 1
+            self.state.commit_primary(pending)
             self.pending_operation = None
 
-        next_index = self.last_index + 1
+        next_index = self.state.next_index()
         operation: dict[str, Any] = {
             "index": next_index,
             "op": op_type,
@@ -347,9 +237,8 @@ class KeyValueNode:
         acknowledgements = sum(1 for r in results if r["acknowledged"])
 
         if acknowledgements < required:
-            # Keep pending_operation so the primary never reuses next_index.
             self.pending_operation = operation
-            self.stats["writes_rejected_quorum"] += 1
+            self.state.inc_stat("writes_rejected_quorum")
             return jsonify(
                 error="write rejected: replication quorum not reached",
                 index=next_index,
@@ -360,11 +249,7 @@ class KeyValueNode:
                 peer_results=results,
             ), 503
 
-        self._apply_operation_locked(operation)
-        if op_type == "delete":
-            self.stats["deletes_committed"] += 1
-        else:
-            self.stats["writes_committed"] += 1
+        self.state.commit_primary(operation)
 
         response_body: dict[str, Any] = {
             "committed": True,
@@ -400,7 +285,7 @@ class KeyValueNode:
         except (TypeError, ValueError):
             return jsonify(error="'value' must be JSON serialisable"), 400
 
-        with self.lock:
+        with self._write_lock:
             return self._commit_with_quorum_locked("put", key, payload["value"])
 
     def delete(self, key: str):
@@ -409,11 +294,10 @@ class KeyValueNode:
                 error="deletes must be sent to the configured primary",
                 primary=self.primary_url,
             ), 409
-
-        if not isinstance(key, str) or not key:
+        if not key:
             return jsonify(error="'key' must be a non-empty string"), 400
 
-        with self.lock:
+        with self._write_lock:
             return self._commit_with_quorum_locked("delete", key)
 
     def replicate(self):
@@ -438,35 +322,22 @@ class KeyValueNode:
         ):
             return jsonify(error="invalid replication operation"), 400
 
-        normalized = self._normalize_operation(operation)
-
-        with self.lock:
-            existing = self.applied_operations.get(index)
-
-            if index <= self.last_index:
-                if existing is not None and self._normalize_operation(existing) == normalized:
-                    return jsonify(acknowledged=True, message="duplicate already applied"), 200
-                self.stats["writes_rejected_conflict"] += 1
-                return jsonify(error="conflicting or obsolete operation"), 409
-
-            if index != self.last_index + 1:
-                self.stats["writes_rejected_conflict"] += 1
-                return jsonify(
-                    error="out-of-order operation",
-                    expected_index=self.last_index + 1,
-                    received_index=index,
-                ), 409
-
-            self._apply_operation_locked(normalized)
-
+        outcome, detail_index = self.state.apply_replicated(operation)
+        if outcome == "duplicate":
+            return jsonify(acknowledged=True, message="duplicate already applied"), 200
+        if outcome == "conflict":
+            return jsonify(error="conflicting or obsolete operation"), 409
+        if outcome == "gap":
+            return jsonify(
+                error="out-of-order operation",
+                expected_index=detail_index,
+                received_index=index,
+            ), 409
         return jsonify(acknowledged=True, message="operation applied"), 200
 
     def read(self, key: str):
         if self.role == "primary":
-            with self.lock:
-                self.stats["reads_primary"] += 1
-                record = self.store.get(key)
-                index = self.last_index
+            record, index = self.state.read_local(key, "reads_primary")
             if record is None:
                 return jsonify(error="key not found", last_index=index), 404
             return jsonify(
@@ -477,7 +348,8 @@ class KeyValueNode:
                 consistency="primary",
             ), 200
 
-        if self.primary_url:
+        mode = request.args.get("consistency", "primary")
+        if mode != "local" and self.primary_url:
             encoded_key = quote(key, safe="")
             try:
                 status, body = http_json(
@@ -487,28 +359,25 @@ class KeyValueNode:
                 )
                 if status == 200:
                     body["consistency"] = "forwarded_to_primary"
-                with self.lock:
-                    self.stats["reads_forwarded"] += 1
+                self.state.inc_stat("reads_forwarded")
                 return jsonify(body), status
             except ConnectionError:
                 pass
 
-        with self.lock:
-            self.stats["reads_stale_fallback"] += 1
-            record = self.store.get(key)
-            index = self.last_index
+        record, index = self.state.read_local(key, "reads_stale_fallback")
+        label = "local_explicit" if mode == "local" else "local_fallback_stale_possible"
         if record is None:
             return jsonify(
                 error="key not found on local replica",
                 last_index=index,
-                consistency="local_fallback_stale_possible",
+                consistency=label,
             ), 404
         return jsonify(
             key=key,
             value=record["value"],
             version=record["version"],
             last_index=index,
-            consistency="local_fallback_stale_possible",
+            consistency=label,
         ), 200
 
     def internal_log(self):
@@ -518,14 +387,7 @@ class KeyValueNode:
         except ValueError:
             return jsonify(error="from_index must be an integer"), 400
 
-        with self.lock:
-            operations = [
-                copy.deepcopy(self.applied_operations[idx])
-                for idx in range(from_index, self.last_index + 1)
-                if idx in self.applied_operations
-            ]
-            last_index = self.last_index
-
+        operations, last_index = self.state.log_slice(from_index)
         return jsonify(
             node_id=self.node_id,
             from_index=from_index,
@@ -534,15 +396,16 @@ class KeyValueNode:
         ), 200
 
     def internal_state(self):
-        with self.lock:
-            return jsonify(
-                node_id=self.node_id,
-                role=self.role,
-                last_index=self.last_index,
-                store=copy.deepcopy(self.store),
-                has_pending_operation=self.pending_operation is not None,
-                stats=dict(self.stats),
-            )
+        snap = self.state.snapshot()
+        return jsonify(
+            node_id=self.node_id,
+            role=self.role,
+            last_index=snap["last_index"],
+            store=snap["store"],
+            has_pending_operation=self.pending_operation is not None,
+            wal_enabled=self.wal_path is not None,
+            stats=snap["stats"],
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -551,18 +414,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--role", choices=("primary", "replica"), required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument(
-        "--peers",
-        default="",
-        help="Comma-separated replica base URLs; used by the primary.",
-    )
-    parser.add_argument(
-        "--primary-url",
-        default="",
-        help="Primary base URL; used by replicas for read forwarding and sync.",
-    )
+    parser.add_argument("--peers", default="")
+    parser.add_argument("--primary-url", default="")
     parser.add_argument("--timeout", type=float, default=0.5)
     parser.add_argument("--quorum-size", type=int, default=2)
+    parser.add_argument("--wal-path", default="")
     return parser.parse_args()
 
 
@@ -594,23 +450,24 @@ def main() -> None:
         primary_url=args.primary_url or None,
         timeout=args.timeout,
         quorum_size=args.quorum_size,
+        wal_path=args.wal_path or None,
     )
 
     if args.role == "replica":
         synced = node.sync_from_primary()
         if synced:
-            LOGGER.info("Caught up %d log entries from primary before serving.", synced)
+            LOGGER.info("Caught up %d entries from primary", synced)
 
     server = make_server(args.host, args.port, node.app, threaded=True)
 
     def _shutdown_handler(signum, _frame):
-        LOGGER.info("Received signal %s; shutting down cleanly.", signum)
+        LOGGER.info("Shutting down on signal %s", signum)
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown_handler)
     signal.signal(signal.SIGINT, _shutdown_handler)
 
-    LOGGER.info("Starting %s node on %s:%s", args.role, args.host, args.port)
+    LOGGER.info("Listening (%s) on %s:%s", args.role, args.host, args.port)
     try:
         server.serve_forever()
     finally:
