@@ -1,0 +1,82 @@
+services:
+  primary:
+    build: .
+    container_name: kv-primary
+    command:
+      - "--node-id"
+      - "node-1"
+      - "--role"
+      - "primary"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "5001"
+      - "--peers"
+      - "http://replica-a:5002,http://replica-b:5003"
+      - "--quorum-size"
+      - "2"
+      - "--wal-path"
+      - "/data/primary.wal"
+    ports:
+      - "5001:5001"
+    volumes:
+      - primary_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/health', timeout=2)"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+      start_period: 2s
+
+  replica-a:
+    build: .
+    container_name: kv-replica-a
+    command:
+      - "--node-id"
+      - "node-2"
+      - "--role"
+      - "replica"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "5002"
+      - "--primary-url"
+      - "http://primary:5001"
+      - "--wal-path"
+      - "/data/replica-a.wal"
+    ports:
+      - "5002:5002"
+    volumes:
+      - replica_a_data:/data
+    depends_on:
+      primary:
+        condition: service_healthy
+
+  replica-b:
+    build: .
+    container_name: kv-replica-b
+    command:
+      - "--node-id"
+      - "node-3"
+      - "--role"
+      - "replica"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "5003"
+      - "--primary-url"
+      - "http://primary:5001"
+      - "--wal-path"
+      - "/data/replica-b.wal"
+    ports:
+      - "5003:5003"
+    volumes:
+      - replica_b_data:/data
+    depends_on:
+      primary:
+        condition: service_healthy
+
+volumes:
+  primary_data:
+  replica_a_data:
+  replica_b_data:
